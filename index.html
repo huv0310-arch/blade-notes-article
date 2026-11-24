@@ -1,0 +1,157 @@
+<!DOCTYPE html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>能力从来不只是参数量的函数</title><style>body{max-width:720px;margin:40px auto;padding:0 20px;font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif;line-height:1.85;color:#24292f;background:#fff}
+h1{font-size:1.6em;border-bottom:2px solid #d0d7de;padding-bottom:.3em}h2{font-size:1.25em;margin-top:2em}
+blockquote{border-left:4px solid #d0d7de;margin:0;padding:0 1em;color:#57606a;background:#f6f8fa}
+code{background:#f6f8fa;padding:2px 5px;border-radius:4px;font-size:.9em}
+table{border-collapse:collapse}td,th{border:1px solid #d0d7de;padding:6px 12px}</style></head><body><h1>能力从来不只是参数量的函数</h1>
+<p><em>一份现场笔记：在 8GB 预算下，把稀疏专家权重表蒸馏进 sub-billion 级稠密模型。</em></p>
+<hr />
+<h2>摘要</h2>
+<p>端侧语言模型的默认经济学是：能力按参数量计价——想要更强，就得付更多显存。我们花了几个月验证另一个假设：<strong>能力 = 底子 × 用法</strong>。对固定的小体量来说，权重是怎么炼出来的、推理时怎么被读取，跟权重有多少同样重要。</p>
+<p>先说结论：一个 0.6B 参数的稠密模型（Apache-2.0 底模，从稀疏 MoE 教师蒸馏而来），在严格判分协议下的 GSM8K 上拿到 <strong>110/200，同 seed、同 prompt 模板、同采样配置下的裸底模只有 52/200</strong>（+58 分）。消融实验更锋利：只喂答案、不带 KD 信号的 SFT 臂反而<strong>掉到 7/200</strong>——比什么都不做还差。这基本把全部增益归因到了教师软标签，而不是数据量或格式调教。整个成品 bf16 约 1.2GB，量化后约 400MB（Q4_K_M），笔记本 CPU 就能评测和服务。</p>
+<p>我们也如实汇报没做成的部分：跨家族的 router 级蒸馏、一个 EOS 调优臂，还有一种"幽灵进度"式的失败——训练循环整夜看着活着，实际吞掉的有用梯度是零。错位的两个 tokenizer 悄悄把 KL 项配错了位，梯度范数冲过跳步守卫又把每个坏 batch 全数吞掉。我们认为这段失败分析是全文最可迁移的部分。</p>
+<p><strong>关键词：</strong> 知识蒸馏（KD）、mixture-of-experts、跨 tokenizer 对齐、梯度裁剪、test-time compute、端侧部署</p>
+<hr />
+<h2>1. 引言：两个公式</h2>
+<p>行业对小设备能力的默认理解是一个乘法：</p>
+<blockquote>
+<p>能力 ≈ 参数量 × 算力</p>
+</blockquote>
+<p>在这个公式下，8GB 的机器就只配拿到 8GB 的结果，通往"更多"的唯一路径是"更大"。我们认为，在受限硬件上真正发生的事情，符合另一个分解式：</p>
+<blockquote>
+<p>能力 = 底子 × 用法</p>
+</blockquote>
+<p><strong>底子</strong>是权重里装着什么、怎么炼出来的——哪些专家块活到了稠密骨架里，学生的 loss 是不是真的读到了稀疏教师的 logits，训练循环消费的是真梯度还是表演。<strong>用法</strong>是推理时你拿这些权重做什么——采样策略、候选预算、什么时候停。这两项都不出现在参数量里，但任何一项都能让跑分动几十个点。</p>
+<p>这不是靠一次实验喊出的反调，好几条公开工作线都指向同一方向：</p>
+<ul>
+<li><strong>测试时搜索在等算力量级上打赢参数扩展。</strong> Snell 等人（2024）[1] 证明：在小模型尚有非平凡成功率的问题上，对着 verifier 做 compute-optimal 的 test-time search，能超过约 14 倍大的模型——"用法"按 FLOPs 计价，替代了参数量。</li>
+<li><strong>领域定向微调能让 7B–8B 通过 USMLE 类考试。</strong> Meerkat 工作（npj Digital Medicine, 2025）[2] 报告 7B/8B 模型经思维链数据策展在 MedQA 上达到 77.1%——越过 60% 及格线，也超过一个 70B 开源前辈。这是底子的胜利，不是体量的胜利。</li>
+<li><strong>稀疏模型可以向激活参数压缩是被公认的设计轴。</strong> MatFormer（Gemma 3 采用了其思想）[3] 以约 15% 的额外训练成本在 transformer 内嵌嵌套子模型；DeepSeek-V3 [4] 把细粒度专家分解推到 671B 总参 / 37B 激活。"总参数"和"推理时真正需要的参数"之间的差距，已经是明牌。</li>
+<li><strong>跨 tokenizer 蒸馏是一个公认的开放问题。</strong> ULD [5]、CTULM/DualShort [6] 这一整条近期文献线存在，恰恰因为教师和学生的词表对不齐。我们第 3 节的那个事故，就发生在这道缝上。</li>
+</ul>
+<p>这篇笔记的贡献偏实证、偏"负空间"：我们在 8GB 预算下跑通了一条多周的稀疏 MoE→sub-billion 稠密学生蒸馏产线，记录了 (a) 一个带完整消融臂的端到端胜利，(b) 一次静默失败的诊断（tokenizer 错位叠加跳步守卫造成的幽灵训练进度），以及 (c) 几个诚实的死胡同。</p>
+<p>我们放出调好的权重和评测协议。训练管线、数据配方、权重移植参数不放（见第 6 节）。</p>
+<hr />
+<h2>2. 设定</h2>
+<p><strong>学生。</strong> 0.6B 参数的稠密 decoder-only transformer，Apache-2.0 开源底模，bf16 checkpoint 约 1.2GB。全部训练和评测跑在一块租来的 16GB GPU 内；成品量化后（Q4_K_M 约 400MB）在 8GB 机器或笔记本 CPU 上即可评测和服务。</p>
+<p><strong>教师。</strong> 一个公开的开源稀疏 MoE 模型，与学生<strong>不同 tokenizer 家族</strong>——故意的：同家族蒸馏相对容易，我们想专门压那些静默失败爱藏的接缝。教师 logits 一次性烘焙成 CPU 侧张量（top-k、fp16），师生从不同时占 GPU。</p>
+<p><strong>任务与指标。</strong> GSM8K [7]（小学数学应用题），严格协议评测：ChatML 模板、固定 seed、带 repetition penalty 的温度采样、生成到答案标记符截断、最终数字精确匹配计分。我们按嵌套规模报数（n=50 / n=100 / 全量 n=200），因为小样本方差真实存在，读者应该亲眼看到抖动而不是相信我们的平滑。所有臂共用同一份评测脚本，只有权重不同。</p>
+<hr />
+<h2>3. 方法概览</h2>
+<p>撑起这条产线的是三个想法。每一个只讲到"为什么有效"的层面，不讲"哪些常数让它有效"——这个区别在商业上重要（第 6 节），在科学上也重要：只给常数不给推理，等于给别人一份可以照抄但会调错的菜谱。</p>
+<h3>3.1 权重表手术：把 MoE checkpoint 当成一本可编辑的账本</h3>
+<p>稀疏专家 checkpoint 不是一个整体，而是一张<strong>表</strong>——每层几十个专家 FFN 块，外加一个索引它们的 router。表的视角暗示了一套很便宜的操作序列，在任何重梯度动手之前：</p>
+<ol>
+<li><strong>挑骨干。</strong> 从每层的专家池里保留一小撮权重块，组成稠密学生的 FFN。选择依据离线积累的路由统计（哪些专家在哪类问题上真的开火、结果如何），而不是原始激活幅值。我们血泪换来的告诫：纯无监督的选择会丢掉教师大部分的<strong>路由行为</strong>，哪怕保住了不少<strong>权重</strong>——在我们的测量里，无监督 top-K 骨干在真实 token 上只覆盖教师 top-8 概率质量的约四分之一。选择必须用有监督探针复核，几十个样本就够抓出一份坏名单。</li>
+<li><strong>对齐焊接。</strong> K 个专家块坍缩成一个稠密 FFN 时的维度账并不显然（中间维度和分组结构互相纠缠）；搞错的后果是一个加载干净、输出垃圾的学生。</li>
+<li><strong>小剂量修复。</strong> 只针对 diff 图判定为病态的层×区域格子做定向梯度更新，剂量刻意压低。这一步是所有人都会低估的：剪枝不修，和剪枝再修，是两个不同的模型。公开证据也同意——Minitron [8] 发现迭代式 prune→distill 比一刀切好出双位数分数，Gromov 等人 [9] 证明连整层删除都需要一次疗愈性微调才能守住困惑度。</li>
+</ol>
+<p>我们刻意<strong>不</strong>声称的一点：单靠手术就能转移能力。我们自己的死胡同（5.1 节）说的是反面——手术定的是<strong>起始几何</strong>，真正搬运能力的是蒸馏信号。</p>
+<h3>3.2 梯度快速处理：幽灵进度事件</h3>
+<p>这是那个值十次成功的 bug 故事。</p>
+<p><strong>症状。</strong> 一次跨 tokenizer KD 运行在进程层面看起来健康得很——GPU 满载、每步都在打 loss——但全局梯度范数连续几小时钉死在 300 到 450 之间，优化器相对墙钟时间几乎没前进。循环是活的，训练不是。</p>
+<p><strong>根因，三段连锁：</strong></p>
+<ul>
+<li><em>第一段——按位置截断。</em> 朴素的 KL 配对把师生监督序列截到 <code>min(len_teacher, len_student)</code> 然后逐位置配对。两套 BPE 词表对同一文本的切分是不同的：在我们那个坏配置里，教师在一个样本上产出 45 个监督位置，学生产出 57 个。第一个分歧点之后的位置不是"有噪声"——是<strong>配错了对象</strong>：学生第 k 个 token 被要求去匹配教师对一个完全不同字符片段给出的分布。</li>
+<li><em>第二段——守卫把证据吞了。</em> 标准做法会加一个超范数跳步守卫：‖g‖ 超过阈值就丢弃该 batch（经典动机是 loss scaling 里的 fp16 溢出处理 [10]）。KL 目标被系统性投毒之后，<strong>每个</strong> batch 都爆阈值，守卫尽职尽责地把一切全丢了。净效果：几千次前向，零次生效梯度，一整日志文件的数字——幽灵进度。要是没有这个守卫，运行会在几分钟内明显发散、当场被抓。<strong>安全机制把一次响亮失败变成了一次静默失败。</strong></li>
+<li><em>第三段——没人在数样本。</em> 进程存活监控看的是任务在不在跑，不看每一步有没有消费真实数据。最终点名病灶的诊断朴素得可笑：度量 samples-per-step（每小时生效梯度事件数），而不是每小时步数。</li>
+</ul>
+<p><strong>修法，概念层面：</strong></p>
+<ul>
+<li><em>字符边界贪心对齐。</em> 不按 token 下标配对，而是把师生的切分还原到字符层面比对：KL 项只在两边分词边界重合的位置存在，其余位置一律不配对。不配对，就不投毒——监督密度会降，但当备选密度携带的是负价值时，这是笔好买卖。具体的匹配与发射规则属于实现细节，随管线保留（第 6 节）。（ULD [5]、CTULM/DualShort [6] 这一整条跨 tokenizer 蒸馏文献的存在本身就说明这道缝人尽皆破；我们的贡献更多在诊断模式，而非某个具体匹配器。）</li>
+<li><em>梯度封顶代替丢批。</em> 把跳步守卫换成对更新幅度的封顶：方向保留，只裁大小。在我们的运行里，这把"全部跳批、什么都没学到"换成了"大步长但有限、KL 单调下降"——同一个通宵窗口从一条死线变成持续下降，top-1 一致率爬进高位（确切数字见 4.2 节）。封顶本来就是优化器卫生的一部分；教训的特异之处是：<strong>在跨 tokenizer 场景下，跳过是毒药，封顶才是解药</strong>——你跳的那些大范数是你自己没对齐造出来的伪影，不是数据真坏。</li>
+</ul>
+<p>这次事件还沉淀出一条推论规则：<strong>在相信任何 loss 地板之前，先验监督信号。</strong> 更早的一个阶段，我们把"reverse-KL 停在 1.6 不动"当成正经科学发现研究了好几周，实际原因是一个教师 checkpoint 被套着学生的 config 用 <code>strict=False</code> 加载——那位"教师"是个随机初始化的空壳。从此教师加载时的 missing/unexpected-key 清单是硬闸门。任何"loss 下不去"都值得先怀疑这一层：验证花几秒钟，误诊赔了我们一个月的租卡费。</p>
+<h3>3.3 菱形调度：展开、中层评分、塌缩</h3>
+<p>第三个想法关于在候选权重编辑配置的空间里怎么花钱，形状借自成熟的公开范式：对着 verifier 的 best-of-N / 树搜索 [1]、投机解码里的 draft-and-verify 级联 [11]、beam 式的展开-塌缩调度。具体是：在表层廉价地展开多个候选编辑，用<strong>动态</strong>代理评分（探针集上的真实成对前向，不是静态表面对比），在投入更深预算前围绕幸存者塌缩 beam。两个内部发现塑造了这个设计：(a) 同等前向预算下，结构化展开在稀疏解地形上碾压随机扰动搜索；(b) 当网络里存在恰好吸收你在调的那组自由度的归一化时，静态表面对比指标会<strong>毫无预警地系统性指错方向</strong>——RMSNorm 让尺度变换在 norm 之内不可见，这个恒等式谁都能在纸上验证，但搜索者们就是一遍遍走进去。我们把 (b) 视为对所有做现代架构权重空间编辑的人的可迁移警告，完整论述另文再写。</p>
+<hr />
+<h2>4. 实测数据</h2>
+<p>以下全部数字直接读自最终三臂运行的评测 JSON：同一评测脚本、seed=20、ChatML 模板、各臂统一 repetition penalty、答案标记截断、最终数字精确匹配。给出嵌套切片（50 ⊂ 100 ⊂ 200），让你亲眼看到小样本抖动，不必信我们的平滑。</p>
+<h3>4.1 三臂对比（GSM8K，严格精确匹配）</h3>
+<table>
+<thead>
+<tr>
+<th>臂</th>
+<th>是什么</th>
+<th>n=50</th>
+<th>n=100</th>
+<th>n=200</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>bare</strong></td>
+<td>未改动的 0.6B 底模</td>
+<td>11/50</td>
+<td>24/100</td>
+<td><strong>52/200</strong></td>
+</tr>
+<tr>
+<td><strong>early-kd</strong></td>
+<td>早前轮次的 KD 臂（旧管线）</td>
+<td>12/50</td>
+<td>24/100</td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>sft-only</strong></td>
+<td>全量语料、只喂答案的 SFT，<em>无</em> KD 项</td>
+<td>2/50</td>
+<td>3/100</td>
+<td><strong>7/200</strong></td>
+</tr>
+<tr>
+<td><strong>tuned</strong></td>
+<td>短链 SFT + 跨家族 KD（最终配方族）</td>
+<td>28/50</td>
+<td>54/100</td>
+<td><strong>110/200</strong></td>
+</tr>
+</tbody>
+</table>
+<p>我们认为承重的三条读数：</p>
+<ol>
+<li><strong>扛住结果的是蒸馏项，不是数据。</strong> SFT 语料扩到约 3.6 倍、同时拿掉教师 logits 的 KL，得到的模型<strong>比底模还差</strong>（7/200 vs 52/200）。只喂答案的监督教会的是格式，代价是推理行为本身；软标签才是保住推理流形的东西。这与标准 KD 文献 [12] 的机理一致，也与 GKD 一类"匹配教师分布比模仿其 argmax 更重要"的观察 [13] 相容，但我们更希望大家在自家栈上复跑的，是这个对着<strong>更大</strong> SFT 语料的干净消融。</li>
+<li><strong>早前的 KD 臂（early-kd）在每个切片上都和 bare 打平</strong>（12/50、24/100）。同样的任务、差不多的预算、约等于零的转移。early-kd 和 tuned 之间的差值是管线卫生——包括 3.2 节的对齐与梯度处理——不是模型规模也不是新数据。当你的 KD"不起作用"时，第一假设应该是它没接对，而不是 KD 不行。</li>
+<li><strong>一个 55% 严格 GSM8K 的 0.6B 成品，量化后约 400MB。</strong> 作为参照，底模在同协议下是 26%。我们不碰榜单叙事——GSM8K 对更大的模型早已饱和，且全部为自测数字——主张在于<strong>固定体量下的比值</strong>。</li>
+</ol>
+<h3>4.2 跨家族泛化（logit 层成立，及其诚实边界）</h3>
+<p>在对齐修复之后，我们曾把公开的 OLMoE-1B-7B 稀疏教师 [14] 蒸馏进同一 0.6B 稠密学生家族：300 步、零跳批、reverse-KL 单调下降 2.75 → 0.57、师生 token 级 top-1 一致率达到 <strong>0.85–0.89</strong>。两个不同的 tokenizer 家族、两种不同的专家结构，学生在 logit 层面确实学会了按教师的分布说话。这就是跨家族 MoE→dense 的泛化主张，在这一层它成立。</p>
+<p>但它<strong>不</strong>自动向下传导：这个学生版本在自由生成的 GSM8K 冒烟测试上 0/5。logit 一致 ≠ 任务能力——一个 0.6B 学生可以在 87% 的位置上对上教师的下一 token argmax，同时在采样下拼不出一条连贯的多步推理链。所以我们把跨家族结果标注为<strong>logit 层已确立、自由生成层未达成</strong>，并说明 4.1 的冠军臂正是在管线围绕这个缺口重新调校之后才拿到的下游能力。任何只引用 top-k 一致率、旁边却不放一个生成评测的蒸馏成功声明都是在骗自己——我们先骗过自己。</p>
+<hr />
+<h2>5. 讨论：死掉了什么，以及为什么那也是数据</h2>
+<p>一篇只报获胜臂的文章是营销。这些死胡同烧掉的是真实租金小时；列出来，是因为每一条都在替别人关上一扇正要敲的门。</p>
+<h3>5.1 跨家族的 router 级蒸馏：被算术判死</h3>
+<p>压缩 MoE 时的直觉动作是顺手训练学生的 router 去模仿教师路由。我们在一个剪过骨干、冻结专家本体的学生上试了。router logits 上的 KL 收敛得漂漂亮亮（5.5 → 3.9）——模型却变差了。诊断：骨干剪完之后，<strong>教师 top-8 路由质量里只有 5.6% 落在学生还能激活的槽位上</strong>。监督 router 等于把概率往学生可达集合里已经不存在的专家身上推。你没法把一位招聘经理的偏好蒸馏给一家已经裁掉那些岗位的公司。Router 和专家本体是耦合的：要在监督下动其中一个，就必须联动地、小剂量地修另一个——要么两个都别动。同一方向的第二个早期数据点：完全不做蒸馏的纯结构手术（每层保留 top-K 专家、重映射 router 行、砍掉约 70% 参数、装配逐 key 核验）在 GSM8K 冒烟探测上仍然输出 0/5 的胡话，激进和保守两种掩码变体都是。选择质量不是瓶颈，缺的有监督修复才是。</p>
+<h3>5.2 教师悖论臂：无可蒸之处</h3>
+<p>在一个任务族上，联合 KD 臂（教师 logits + CE 同目标）始终没赢过未调的底模。事后找到根因：教师自己在同一把尺子上只有 2/20——蒸馏开始前学生就已经到达教师水位。蒸馏转移的是师生差距；差距为零，期望收益就是零，对着同级教师追 loss 下降只是注入噪声。由此立下两条规矩：(a) 在建任何 KD 管线之前，先用你自己的评测 harness 跑一遍教师；(b) 先怀疑监督信号，再怀疑优化器（见 3.2 的随机空壳教师——同一个教训，更狠的事故）。</p>
+<h3>5.3 EOS/重复惩罚调优：药在推理侧，不在训练侧</h3>
+<p>一个退化的重复循环（模型无限复读自己的停止行为）吃掉了一整个训练臂：在 EOS 位置做 token 加权 CE，宽松分买到 +0.5，严格精确匹配上<strong>一分未涨</strong>。同样的病症，很大程度上靠拧一个推理侧旋钮（粗调 repetition penalty，过度调反而更糟）加上评测时在答案标记处硬截断就消退了。有些"训练问题"是采样问题穿了件风衣。先确认你手里是哪种，再决定烧不烧 GPU-days。</p>
+<h3>5.4 一般性局限</h3>
+<ul>
+<li><strong>只有一个基准族。</strong> 定量主张全部围绕 GSM8K。数学应用题能力不等于通用能力；我们不承诺 MMLU/humaneval。</li>
+<li><strong>全部自测。</strong> 没有第三方 harness；我们公布协议恰恰是为了让你<em>可以</em>不同意我们的判分器。严格判分在答案标记处截断并要求数值精确匹配——宽松的判分器大概率会给所有臂报更高的分，但愿保持排序不变。</li>
+<li><strong>n=200 不大。</strong> 52→110 的差值远超二项噪声（p≈0.5 时约 ±3.5 分），但 early-kd 与 bare 的打平（n=50 下 12 vs 11）就<em>落在</em>噪声里——我们不把那一格解读为任何证据，只能说"未见效应"。</li>
+<li><strong>底子依赖。</strong> 底模自身预训练质量在每个数字底下做着未知份额的工作。"任意 0.6B 模型 + 我们的管线 = 这个成绩"不是我们能支持的主张。</li>
+</ul>
+<hr />
+<h2>6. 我们留了一手（以及留了哪一手）</h2>
+<p>对这个项目的形态直说了：这是一条生产中的产线，不是一个开源实验室。</p>
+<p><strong>放出的：</strong> tuned 臂权重（Apache-2.0 衍生，含底模署名）、4.1 各臂的评测 JSON、可复现的评测命令行（模板/seed/采样配置）——任何读者都可以在自己的硬件上核验分数。</p>
+<p><strong>刻意不放出的：</strong> 训练管线与脚本；数据集构建配方（哪些题、多少条、怎么格式化）；路由统计账本与骨干选择参数；loss 整形细节（温度调度、加权斜坡、尾部强化）与梯度封顶常数；教师侧中间产物（烘焙 logits、门控矩阵）。不是因为哪部分能申请专利——是因为那就是产品本身。第 3–5 节的每一个小时，都是按"这套动作的顺序才有人愿意付费"的假设买来的。</p>
+<p>本文档里最有用的部分免费：3.2 节。如果你的跨 tokenizer 蒸馏循环活着、梯度范数却钉在高位、步数迟迟不落地——今晚就去数你的 samples-per-step。此外，对于希望把这条线落到自家模型上的团队，完整方法与调校参数可通过商用咨询获得；联系渠道见本文发布处。</p>
+<hr />
+<h2>参考文献</h2>
+<p>[1] Snell, C., Lee, J., Xu, K., Kumar, A. "Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters." arXiv:2408.03314 (2024). https://arxiv.org/abs/2408.03314</p>
+<p>[2] Kim, H., Hwang, H., Lee, J., et al. "Small Language Models Learn Enhanced Reasoning Skills from Medical Textbooks" (Meerkat). npj Digital Medicine (2025). https://www.nature.com/articles/s41746-025-01653-8 ; preprint arXiv:2404.00376.</p>
+<p>[3] Bakman, D., Boffa, M., O'Madhaircin, B., et al. "MatFormer: Nested Transformer for Elastic Inference." arXiv:2310.07707 (2023/2024). https://arxiv.org/abs/2310.07707</p>
+<p>[4] DeepSeek-AI. "DeepSeek-V3 Technical Report." arXiv:2412.19437 (2024). https://arxiv.org/abs/2412.19437</p>
+<p>[5] Boizard, N., et al. "Towards Cross-Tokenizer Distillation: the Universal Logit Distillation Loss for LLMs (ULD)." ICLR 2025. arXiv:2402.12030. https://arxiv.org/abs/2402.12030</p>
+<p>[6] Cui, Y., Sun, Y., Liu, Z., Wang, D. "Aligning Distillation Aligns Tokenizers: Cross-Tokenizer Utility Maximization with Dual Shortlists (CTULM/DualShort)." arXiv:2503.23164 (2025). https://arxiv.org/abs/2503.23164</p>
+<p>[7] Cobbe, K., Kosaraju, V., Bavarian, M., et al. "Training Verifiers to Solve Math Word Problems" (GSM8K). arXiv:2110.14168 (2021). https://arxiv.org/abs/2110.14168</p>
+<p>[8] Muralidharan, S., Tur, G., et al. "Compact Language Models via Pruning and Knowledge Distillation" (Minitron). NeurIPS 2024. arXiv:2407.14679. https://arxiv.org/abs/2407.14679</p>
+<p>[9] Gromov, A., Tirumala, K., Shapourian, H., Glorioso, P., Vogelstein, J.T. "The Unreasonable Ineffectiveness of the Deeper Layers." arXiv:2403.17887 (2024). https://arxiv.org/abs/2403.17887</p>
+<p>[10] Micikevicius, M., Bangaru, S., Cao, J., et al. "Mixed Precision Training." ICLR 2018. arXiv:1710.03745 — 3.2 节所讨论的溢出触发跳步守卫的出处。https://arxiv.org/abs/1710.03745</p>
+<p>[11] Leviathan, Y., Kalman, M., Matias, Y. "Fast Inference from Transformers via Speculative Decoding." ICML 2023. arXiv:2211.17192. https://arxiv.org/abs/2211.17192</p>
+<p>[12] Hinton, G., Vinyals, O., Dean, J. "Distilling the Knowledge in a Neural Network." arXiv:1503.02531 (2015). https://arxiv.org/abs/1503.02531</p>
+<p>[13] Agarwal, R., Vieillard, N., Zhou, Y., et al. "On-Policy Distillation of Language Models: Learning from Self-Generated Mistakes" (GKD). ICLR 2024. arXiv:2306.13649. https://arxiv.org/abs/2306.13649</p>
+<p>[14] Muennighoff, N., Soldaini, L., Groeneveld, D., et al. "OLMoE: Open Mixture-of-Experts Language Models." arXiv:2409.02068 (2024). https://arxiv.org/abs/2409.02068</p></body></html>
